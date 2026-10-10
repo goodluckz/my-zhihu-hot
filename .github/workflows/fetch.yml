@@ -1,0 +1,75 @@
+name: Fetch Zhihu Hot
+
+on:
+  schedule:
+    # Every 6 hours at minute 5 (UTC) → 00:05, 06:05, 12:05, 18:05 UTC
+    # = 08:05, 14:05, 20:05, 02:05 Asia/Shanghai. Minute 5 dodges on-the-hour
+    # scheduling congestion (GitHub cron is best-effort).
+    - cron: '5 */6 * * *'
+  workflow_dispatch:  # allow manual runs from the Actions tab
+
+permissions:
+  contents: write     # needed so GITHUB_TOKEN can push the appended JSONL
+
+concurrency:
+  group: fetch-zhihu-hot
+  cancel-in-progress: false  # let an in-flight run finish; queue the next
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Fetch all sources
+        run: |
+          # Run each source independently. A failure in one doesn't abort
+          # the others — we still want partial data committed.
+          failed=()
+          for src in zhihu bilibili weibo douyin kuaishou baidu v2ex huxiu; do
+            echo "::group::$src"
+            if ! python3 fetch.py "$src"; then
+              failed+=("$src")
+            fi
+            echo "::endgroup::"
+          done
+          if [ ${#failed[@]} -gt 0 ]; then
+            echo "::warning::Failed sources: ${failed[*]}"
+          fi
+
+      - name: Commit & push (one squashed commit per UTC day)
+        if: always()  # commit whatever data we managed to get
+        run: |
+          set -e
+          BOT_EMAIL="41898282+github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          git config user.email "$BOT_EMAIL"
+
+          git add data/
+          if git diff --staged --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+
+          TODAY=$(date -u +%Y-%m-%d)
+          SUBJECT="data: snapshot $TODAY"
+          LAST_SUBJECT=$(git log -1 --pretty=%s)
+          LAST_EMAIL=$(git log -1 --pretty=%ae)
+
+          # Only amend if the most recent commit is *our* bot's commit for today.
+          # Otherwise (manual commit, new day, fresh repo) make a new commit.
+          if [[ "$LAST_SUBJECT" == "$SUBJECT" && "$LAST_EMAIL" == "$BOT_EMAIL" ]]; then
+            echo "Amending today's commit."
+            git commit --amend --no-edit
+            git push --force-with-lease
+          else
+            echo "First fetch of $TODAY — new commit."
+            git commit -m "$SUBJECT"
+            git push
+          fi
